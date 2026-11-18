@@ -165,15 +165,16 @@ jobs:
 
             echo ">>> [2/4] Generating backend/.env..."
             mkdir -p /var/www/greenloop/backend/uploads
-            umask 077
-            printf "%s\n" \
+            chmod 755 /var/www/greenloop/backend/uploads
+            # umask only inside this subshell, so PM2 (started below) keeps normal file permissions
+            (umask 077; printf "%s\n" \
               "PORT=5000" \
               "NODE_ENV=production" \
               "MONGO_URI=$MONGO_URI" \
               "JWT_SECRET=$JWT_SECRET" \
               "JWT_EXPIRES_IN=7d" \
               "CLIENT_URL=http://$EC2_IP" \
-              > /var/www/greenloop/backend/.env
+              > /var/www/greenloop/backend/.env)
 
             echo ">>> [3/4] Installing production dependencies..."
             cd /var/www/greenloop/backend

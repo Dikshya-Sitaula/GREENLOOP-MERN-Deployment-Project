@@ -197,6 +197,14 @@ jobs:
           done
           echo "Health check failed. On the server run: pm2 logs --lines 50"; exit 1
 
+      # Runs only when something above failed: shows why the API is down (secrets are not printed)
+      - name: Show server logs on failure
+        if: failure()
+        run: |
+          IP=${{ steps.server.outputs.ip }}
+          [ -n "$IP" ] && [ -f "$RUNNER_TEMP/server-key.pem" ] || exit 0
+          ssh $SSH_OPTS ubuntu@$IP 'pm2 status; echo "--- pm2 error log ---"; pm2 logs --nostream --lines 60 --err; echo "--- pm2 out log ---"; pm2 logs --nostream --lines 30 --out; echo "--- nginx error log ---"; sudo tail -n 15 /var/log/nginx/error.log' || true
+
       - name: Remove SSH key
         if: always()
         run: rm -f "$RUNNER_TEMP/server-key.pem"

@@ -7,5 +7,5 @@ export const TYPES = ['sell', 'swap', 'donate', 'repair'];
 export const ACTIONS = TYPES;
 export const STATUSES = ['active', 'reserved', 'paused', 'completed'];
 
-export const unsplash = (id, w = 900) =>
-  `https://images.unsplash.com/photo-${id}?w=${w}&q=80&auto=format&fit=crop`;
+// Demo photos are self-hosted in frontend/public/images (originally from Unsplash), served by Nginx/Vite.
+export const unsplash = (id) => `/images/${id}.jpg`;

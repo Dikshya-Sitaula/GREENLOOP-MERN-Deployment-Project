@@ -27,7 +27,7 @@ const fields = (optional = false) => {
     body('wantedNote').optional().trim().isLength({ max: 140 }).withMessage('Keep the note under 140 characters'),
     body('images').optional().isArray({ max: 5 }).withMessage('Up to 5 images'),
     ...(optional ? [body('images').optional().isArray({ min: 1 }).withMessage('Keep at least one photo')] : []),
-    body('images.*').optional().isString().matches(/^(\/uploads\/[\w.-]+|https:\/\/[^\s]+)$/).withMessage('Invalid image URL'),
+    body('images.*').optional().isString().matches(/^(\/uploads\/[\w.-]+|\/images\/[\w.-]+|https:\/\/[^\s]+)$/).withMessage('Invalid image URL'),
   ];
 };
 

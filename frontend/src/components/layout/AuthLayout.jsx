@@ -3,8 +3,7 @@ import Logo, { LoopMark } from '../ui/Logo';
 import SmartImage from '../ui/SmartImage';
 import { EASE } from '../../lib/motion';
 
-const AUTH_IMAGE =
-  'https://images.unsplash.com/photo-1555041469-a586c61ea9bc?w=1400&q=80&auto=format&fit=crop';
+const AUTH_IMAGE = '/images/auth-bg.jpg';
 
 export default function AuthLayout({ title, subtitle, children, footer }) {
   return (

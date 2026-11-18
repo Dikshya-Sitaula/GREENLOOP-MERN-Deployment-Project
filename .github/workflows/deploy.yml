@@ -10,30 +10,57 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  AWS_REGION: us-east-1
+  AWS_REGION: ${{ secrets.AWS_REGION || vars.AWS_REGION || 'us-east-1' }}
   STACK_NAME: greenloop-stack
   APP_DIR: /var/www/greenloop
+  # Ubuntu 24.04 AMI in us-east-1, pinned so CloudFormation never replaces the instance
+  UBUNTU_AMI: ami-0e86e20dae9224db8
 
 jobs:
-  deploy:
+  # ---------------------------------------------------------------- build
+  build:
+    name: Build
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
 
-      - uses: actions/setup-node@v4
+      - name: Setup Node.js 22
+        uses: actions/setup-node@v4
         with:
           node-version: 22
           cache: npm
-          cache-dependency-path: |
-            frontend/package-lock.json
-            backend/package-lock.json
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install dependencies
+        run: cd frontend && npm ci
 
       # The frontend calls the relative baseURL '/api', so no build-time env vars are needed.
       - name: Build frontend
-        run: |
-          cd frontend
-          npm ci
-          npm run build
+        run: cd frontend && npm run build
+
+      - name: Upload frontend-dist artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: frontend-dist
+          path: frontend/dist/
+          if-no-files-found: error
+          retention-days: 7
+
+  # --------------------------------------------------------------- deploy
+  deploy:
+    name: Deploy
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download frontend-dist artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: frontend-dist
+          path: frontend/dist
 
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
@@ -43,17 +70,22 @@ jobs:
           aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
           aws-region: ${{ env.AWS_REGION }}
 
-      # Pin the AMI: reuse the one the stack already runs so a newer Ubuntu image never replaces
-      # the instance (which would wipe uploaded photos). Look up the latest only on first creation.
-      - name: Resolve Ubuntu 24.04 AMI
+      # Reuse the AMI an existing stack already runs; otherwise use the pinned static AMI.
+      # (Only if that AMI is not available in the region, fall back to the latest Ubuntu 24.04.)
+      - name: Choose AMI
         id: ami
         run: |
           AMI=$(aws cloudformation describe-stacks --stack-name "$STACK_NAME" \
             --query "Stacks[0].Parameters[?ParameterKey=='UbuntuAMI'].ParameterValue" --output text 2>/dev/null || true)
           if [ -z "$AMI" ] || [ "$AMI" = "None" ]; then
-            AMI=$(aws ssm get-parameter \
-              --name /aws/service/canonical/ubuntu/server/24.04/stable/current/amd64/hvm/ebs-gp3/ami-id \
-              --query Parameter.Value --output text)
+            if aws ec2 describe-images --image-ids "$UBUNTU_AMI" >/dev/null 2>&1; then
+              AMI="$UBUNTU_AMI"
+            else
+              echo "::warning::$UBUNTU_AMI is not available here; using the latest Ubuntu 24.04 AMI"
+              AMI=$(aws ssm get-parameter \
+                --name /aws/service/canonical/ubuntu/server/24.04/stable/current/amd64/hvm/ebs-gp3/ami-id \
+                --query Parameter.Value --output text)
+            fi
           fi
           echo "Using AMI $AMI"
           echo "ami=$AMI" >> "$GITHUB_OUTPUT"
@@ -66,9 +98,9 @@ jobs:
             --parameter-overrides InstanceType=t2.micro UbuntuAMI=${{ steps.ami.outputs.ami }} \
             --no-fail-on-empty-changeset
 
-      # After a lab expiry the instance is stopped and gets a NEW public IP; stack outputs are stale,
+      # After a lab expiry the instance is stopped and gets a NEW public IP (stack outputs go stale),
       # so start it if needed and read the live IP from EC2.
-      - name: Start instance and get live IP
+      - name: Get live public IP
         id: server
         run: |
           ID=$(aws cloudformation describe-stacks --stack-name "$STACK_NAME" \
@@ -84,61 +116,76 @@ jobs:
         run: |
           SSM_PATH=$(aws cloudformation describe-stacks --stack-name "$STACK_NAME" \
             --query "Stacks[0].Outputs[?OutputKey=='SSMKeyPath'].OutputValue" --output text)
-          aws ssm get-parameter --name "$SSM_PATH" --with-decryption \
-            --query Parameter.Value --output text > "$RUNNER_TEMP/server-key.pem"
+          KEY=$(aws ssm get-parameter --name "$SSM_PATH" --with-decryption --query Parameter.Value --output text)
+          printf '%s\n' "$KEY" > "$RUNNER_TEMP/server-key.pem"
           chmod 600 "$RUNNER_TEMP/server-key.pem"
-          {
-            echo "SSH_OPTS=-i $RUNNER_TEMP/server-key.pem -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10"
-          } >> "$GITHUB_ENV"
+          # mask the key in logs and expose it to later steps (used by the SSH action)
+          printf '%s\n' "$KEY" | grep -v '^-----' | while read -r line; do [ -n "$line" ] && echo "::add-mask::$line"; done
+          { echo "SSH_KEY<<KEY_EOF"; printf '%s\n' "$KEY"; echo "KEY_EOF"; } >> "$GITHUB_ENV"
+          echo "SSH_OPTS=-i $RUNNER_TEMP/server-key.pem -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10" >> "$GITHUB_ENV"
 
-      - name: Wait for SSH and first-boot bootstrap
+      - name: Wait for SSH and cloud-init
         run: |
+          IP=${{ steps.server.outputs.ip }}
           for i in $(seq 1 60); do
-            if ssh $SSH_OPTS ubuntu@${{ steps.server.outputs.ip }} 'test -f /var/lib/cloud/greenloop-bootstrap-done' 2>/dev/null; then
+            if ssh $SSH_OPTS ubuntu@$IP 'test -f /var/lib/cloud/greenloop-bootstrap-done' 2>/dev/null; then
+              ssh $SSH_OPTS ubuntu@$IP 'sudo cloud-init status --wait || true'
               echo "Server ready"; exit 0
             fi
             echo "Waiting for server bootstrap... ($i/60)"; sleep 10
           done
           echo "Bootstrap did not finish. Check /var/log/userdata.log on the server."; exit 1
 
-      - name: Sync code
+      # The server holds no git checkout: code is pushed from this runner (works for private repos too).
+      # node_modules, .env and uploads/ are excluded, so they are never overwritten or deleted.
+      - name: Copy backend, frontend build and Nginx config
         run: |
           IP=${{ steps.server.outputs.ip }}
           RSH="ssh $SSH_OPTS"
-          # node_modules, .env and uploads/ are excluded, so they are never overwritten or deleted
           rsync -az --delete -e "$RSH" --exclude node_modules --exclude .env --exclude uploads \
             backend/ ubuntu@$IP:$APP_DIR/backend/
           rsync -az --delete -e "$RSH" frontend/dist/ ubuntu@$IP:$APP_DIR/frontend/dist/
           rsync -az -e "$RSH" infra/nginx.conf ubuntu@$IP:/tmp/greenloop-nginx.conf
 
-      - name: Write .env, install deps, restart services
+      - name: Configure and restart services (SSH)
+        uses: appleboy/ssh-action@v1.2.0
         env:
+          EC2_IP: ${{ steps.server.outputs.ip }}
           MONGO_URI: ${{ secrets.MONGO_URI }}
           JWT_SECRET: ${{ secrets.JWT_SECRET }}
-        run: |
-          IP=${{ steps.server.outputs.ip }}
-          # Secrets travel over stdin (never on a command line) and are masked in the Actions log
-          ssh $SSH_OPTS ubuntu@$IP "umask 077; cat > $APP_DIR/backend/.env" <<EOF
-          PORT=5000
-          NODE_ENV=production
-          MONGO_URI=$MONGO_URI
-          JWT_SECRET=$JWT_SECRET
-          JWT_EXPIRES_IN=7d
-          CLIENT_URL=http://$IP
-          EOF
+        with:
+          host: ${{ steps.server.outputs.ip }}
+          username: ubuntu
+          key: ${{ env.SSH_KEY }}
+          script_stop: true
+          envs: EC2_IP,MONGO_URI,JWT_SECRET
+          script: |
+            echo ">>> [1/4] Waiting for cloud-init..."
+            sudo cloud-init status --wait || true
 
-          ssh $SSH_OPTS ubuntu@$IP bash -s <<'REMOTE'
-          set -e
-          mkdir -p /var/www/greenloop/backend/uploads
-          cd /var/www/greenloop/backend
-          npm ci --omit=dev
-          pm2 startOrReload ecosystem.config.cjs --update-env
-          pm2 save
-          sudo cp /tmp/greenloop-nginx.conf /etc/nginx/sites-available/greenloop
-          sudo ln -sf /etc/nginx/sites-available/greenloop /etc/nginx/sites-enabled/greenloop
-          sudo nginx -t
-          sudo systemctl reload nginx || sudo systemctl restart nginx
-          REMOTE
+            echo ">>> [2/4] Generating backend/.env..."
+            mkdir -p /var/www/greenloop/backend/uploads
+            umask 077
+            printf "%s\n" \
+              "PORT=5000" \
+              "NODE_ENV=production" \
+              "MONGO_URI=$MONGO_URI" \
+              "JWT_SECRET=$JWT_SECRET" \
+              "JWT_EXPIRES_IN=7d" \
+              "CLIENT_URL=http://$EC2_IP" \
+              > /var/www/greenloop/backend/.env
+
+            echo ">>> [3/4] Installing production dependencies..."
+            cd /var/www/greenloop/backend
+            npm ci --omit=dev
+
+            echo ">>> [4/4] Restarting PM2 and Nginx..."
+            pm2 startOrReload ecosystem.config.cjs --update-env
+            pm2 save
+            sudo cp /tmp/greenloop-nginx.conf /etc/nginx/sites-available/greenloop
+            sudo ln -sf /etc/nginx/sites-available/greenloop /etc/nginx/sites-enabled/greenloop
+            sudo nginx -t
+            sudo systemctl reload nginx || sudo systemctl restart nginx
 
       - name: Health check
         run: |

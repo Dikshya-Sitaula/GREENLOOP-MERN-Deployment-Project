@@ -6,5 +6,9 @@ dist/
 *.log
 backend/uploads/*
 !backend/uploads/.gitkeep
+# the 3 photos used by existing listings
+!backend/uploads/1794793207928-b00054c75662.png
+!backend/uploads/1794793611413-e87876c1e310.png
+!backend/uploads/1794796780649-cc54dbcc705b.png
 .DS_Store
 .vscode/

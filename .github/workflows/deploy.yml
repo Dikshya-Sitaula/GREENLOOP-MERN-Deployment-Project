@@ -145,6 +145,8 @@ jobs:
           rsync -az --delete -e "$RSH" --exclude node_modules --exclude .env --exclude uploads \
             backend/ ubuntu@$IP:$APP_DIR/backend/
           rsync -az --delete -e "$RSH" frontend/dist/ ubuntu@$IP:$APP_DIR/frontend/dist/
+          # add the tracked uploaded photos; no --delete, so photos uploaded on the server are kept
+          rsync -az -e "$RSH" backend/uploads/ ubuntu@$IP:$APP_DIR/backend/uploads/
           rsync -az -e "$RSH" infra/nginx.conf ubuntu@$IP:/tmp/greenloop-nginx.conf
 
       - name: Configure and restart services (SSH)

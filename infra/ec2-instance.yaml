@@ -1,0 +1,93 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: GreenLoop hosting - EC2 (Ubuntu 24.04) + auto-generated key pair (SSM) + security group
+
+Parameters:
+  InstanceType:
+    Type: String
+    Default: t2.micro
+  UbuntuAMI:
+    Type: AWS::EC2::Image::Id
+    Description: Ubuntu 24.04 LTS AMI. deploy.yml resolves it and pins it on updates so the instance is never replaced by a newer AMI.
+  SSHLocation:
+    Type: String
+    Default: 0.0.0.0/0
+    Description: GitHub-hosted runners have no fixed IPs, so SSH is open but key-only.
+
+Resources:
+  # Private key is stored automatically in SSM Parameter Store at /ec2/keypair/<KeyPairId>
+  ServerKeyPair:
+    Type: AWS::EC2::KeyPair
+    Properties:
+      KeyName: !Sub "${AWS::StackName}-key"
+
+  # Only 80 (Nginx) and 22 (SSH). Backend port 5000 stays private on localhost.
+  ServerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: GreenLoop - HTTP and SSH
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: !Ref SSHLocation
+
+  ServerInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Ref UbuntuAMI
+      InstanceType: !Ref InstanceType
+      KeyName: !Ref ServerKeyPair
+      SecurityGroupIds:
+        - !GetAtt ServerSecurityGroup.GroupId
+      BlockDeviceMappings:
+        - DeviceName: /dev/sda1
+          Ebs:
+            VolumeSize: 12
+            VolumeType: gp3
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-server"
+      # Bootstrap only: tools, swap, app directory. Code, .env and nginx.conf are pushed by GitHub Actions.
+      UserData:
+        Fn::Base64: |
+          #!/bin/bash
+          set -e
+          exec > /var/log/userdata.log 2>&1
+          export DEBIAN_FRONTEND=noninteractive
+
+          # 1 GB swap: t2.micro has 1 GB RAM and npm installs can exhaust it
+          fallocate -l 1G /swapfile
+          chmod 600 /swapfile
+          mkswap /swapfile
+          swapon /swapfile
+          echo '/swapfile none swap sw 0 0' >> /etc/fstab
+
+          apt-get update -y
+          apt-get install -y curl nginx rsync
+          curl -fsSL https://deb.nodesource.com/setup_22.x | bash -
+          apt-get install -y nodejs
+          npm install -g pm2
+
+          mkdir -p /var/www/greenloop/backend/uploads /var/www/greenloop/frontend/dist
+          chown -R ubuntu:ubuntu /var/www/greenloop
+          chmod 755 /var/www /var/www/greenloop
+
+          rm -f /etc/nginx/sites-enabled/default
+          systemctl enable nginx
+
+          # PM2 restarts the API after reboot
+          env PATH=$PATH:/usr/bin pm2 startup systemd -u ubuntu --hp /home/ubuntu
+          touch /var/lib/cloud/greenloop-bootstrap-done
+
+Outputs:
+  InstanceId:
+    Value: !Ref ServerInstance
+  PublicIP:
+    Description: IP at creation time (deploy.yml re-reads the live IP from EC2)
+    Value: !GetAtt ServerInstance.PublicIp
+  SSMKeyPath:
+    Value: !Sub "/ec2/keypair/${ServerKeyPair.KeyPairId}"

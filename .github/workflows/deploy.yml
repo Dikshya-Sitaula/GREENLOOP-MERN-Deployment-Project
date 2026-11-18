@@ -1,0 +1,154 @@
+name: Deploy GreenLoop to AWS EC2
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: us-east-1
+  STACK_NAME: greenloop-stack
+  APP_DIR: /var/www/greenloop
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: |
+            frontend/package-lock.json
+            backend/package-lock.json
+
+      # The frontend calls the relative baseURL '/api', so no build-time env vars are needed.
+      - name: Build frontend
+        run: |
+          cd frontend
+          npm ci
+          npm run build
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      # Pin the AMI: reuse the one the stack already runs so a newer Ubuntu image never replaces
+      # the instance (which would wipe uploaded photos). Look up the latest only on first creation.
+      - name: Resolve Ubuntu 24.04 AMI
+        id: ami
+        run: |
+          AMI=$(aws cloudformation describe-stacks --stack-name "$STACK_NAME" \
+            --query "Stacks[0].Parameters[?ParameterKey=='UbuntuAMI'].ParameterValue" --output text 2>/dev/null || true)
+          if [ -z "$AMI" ] || [ "$AMI" = "None" ]; then
+            AMI=$(aws ssm get-parameter \
+              --name /aws/service/canonical/ubuntu/server/24.04/stable/current/amd64/hvm/ebs-gp3/ami-id \
+              --query Parameter.Value --output text)
+          fi
+          echo "Using AMI $AMI"
+          echo "ami=$AMI" >> "$GITHUB_OUTPUT"
+
+      - name: Deploy CloudFormation stack
+        run: |
+          aws cloudformation deploy \
+            --stack-name "$STACK_NAME" \
+            --template-file infra/ec2-instance.yaml \
+            --parameter-overrides InstanceType=t2.micro UbuntuAMI=${{ steps.ami.outputs.ami }} \
+            --no-fail-on-empty-changeset
+
+      # After a lab expiry the instance is stopped and gets a NEW public IP; stack outputs are stale,
+      # so start it if needed and read the live IP from EC2.
+      - name: Start instance and get live IP
+        id: server
+        run: |
+          ID=$(aws cloudformation describe-stacks --stack-name "$STACK_NAME" \
+            --query "Stacks[0].Outputs[?OutputKey=='InstanceId'].OutputValue" --output text)
+          STATE=$(aws ec2 describe-instances --instance-ids "$ID" --query "Reservations[0].Instances[0].State.Name" --output text)
+          if [ "$STATE" = "stopped" ]; then aws ec2 start-instances --instance-ids "$ID" >/dev/null; fi
+          aws ec2 wait instance-running --instance-ids "$ID"
+          IP=$(aws ec2 describe-instances --instance-ids "$ID" --query "Reservations[0].Instances[0].PublicIpAddress" --output text)
+          echo "ip=$IP" >> "$GITHUB_OUTPUT"
+          echo "Server IP: $IP"
+
+      - name: Fetch SSH key from SSM Parameter Store
+        run: |
+          SSM_PATH=$(aws cloudformation describe-stacks --stack-name "$STACK_NAME" \
+            --query "Stacks[0].Outputs[?OutputKey=='SSMKeyPath'].OutputValue" --output text)
+          aws ssm get-parameter --name "$SSM_PATH" --with-decryption \
+            --query Parameter.Value --output text > "$RUNNER_TEMP/server-key.pem"
+          chmod 600 "$RUNNER_TEMP/server-key.pem"
+          {
+            echo "SSH_OPTS=-i $RUNNER_TEMP/server-key.pem -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10"
+          } >> "$GITHUB_ENV"
+
+      - name: Wait for SSH and first-boot bootstrap
+        run: |
+          for i in $(seq 1 60); do
+            if ssh $SSH_OPTS ubuntu@${{ steps.server.outputs.ip }} 'test -f /var/lib/cloud/greenloop-bootstrap-done' 2>/dev/null; then
+              echo "Server ready"; exit 0
+            fi
+            echo "Waiting for server bootstrap... ($i/60)"; sleep 10
+          done
+          echo "Bootstrap did not finish. Check /var/log/userdata.log on the server."; exit 1
+
+      - name: Sync code
+        run: |
+          IP=${{ steps.server.outputs.ip }}
+          RSH="ssh $SSH_OPTS"
+          # node_modules, .env and uploads/ are excluded, so they are never overwritten or deleted
+          rsync -az --delete -e "$RSH" --exclude node_modules --exclude .env --exclude uploads \
+            backend/ ubuntu@$IP:$APP_DIR/backend/
+          rsync -az --delete -e "$RSH" frontend/dist/ ubuntu@$IP:$APP_DIR/frontend/dist/
+          rsync -az -e "$RSH" infra/nginx.conf ubuntu@$IP:/tmp/greenloop-nginx.conf
+
+      - name: Write .env, install deps, restart services
+        env:
+          MONGO_URI: ${{ secrets.MONGO_URI }}
+          JWT_SECRET: ${{ secrets.JWT_SECRET }}
+        run: |
+          IP=${{ steps.server.outputs.ip }}
+          # Secrets travel over stdin (never on a command line) and are masked in the Actions log
+          ssh $SSH_OPTS ubuntu@$IP "umask 077; cat > $APP_DIR/backend/.env" <<EOF
+          PORT=5000
+          NODE_ENV=production
+          MONGO_URI=$MONGO_URI
+          JWT_SECRET=$JWT_SECRET
+          JWT_EXPIRES_IN=7d
+          CLIENT_URL=http://$IP
+          EOF
+
+          ssh $SSH_OPTS ubuntu@$IP bash -s <<'REMOTE'
+          set -e
+          mkdir -p /var/www/greenloop/backend/uploads
+          cd /var/www/greenloop/backend
+          npm ci --omit=dev
+          pm2 startOrReload ecosystem.config.cjs --update-env
+          pm2 save
+          sudo cp /tmp/greenloop-nginx.conf /etc/nginx/sites-available/greenloop
+          sudo ln -sf /etc/nginx/sites-available/greenloop /etc/nginx/sites-enabled/greenloop
+          sudo nginx -t
+          sudo systemctl reload nginx || sudo systemctl restart nginx
+          REMOTE
+
+      - name: Health check
+        run: |
+          IP=${{ steps.server.outputs.ip }}
+          for i in $(seq 1 12); do
+            if curl -fsS "http://$IP/api/health"; then echo; echo "GreenLoop is live at http://$IP"; exit 0; fi
+            sleep 5
+          done
+          echo "Health check failed. On the server run: pm2 logs --lines 50"; exit 1
+
+      - name: Remove SSH key
+        if: always()
+        run: rm -f "$RUNNER_TEMP/server-key.pem"

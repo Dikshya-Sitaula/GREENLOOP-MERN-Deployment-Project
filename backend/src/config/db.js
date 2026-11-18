@@ -9,7 +9,8 @@ export async function connectDB() {
   } catch (err) {
     console.error('\n✗ Could not connect to MongoDB.');
     console.error('  Is MongoDB running? Check MONGO_URI in backend/.env');
-    console.error(`  MONGO_URI = ${env.mongoUri}`);
+    // never log credentials: mask the user:password part of the URI
+    console.error(`  MONGO_URI = ${env.mongoUri.replace(/\/\/[^@/]*@/, '//***:***@')}`);
     console.error(`  Reason: ${err.message}\n`);
     process.exit(1);
   }
